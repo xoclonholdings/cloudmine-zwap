@@ -37,6 +37,14 @@ async function request(path: string, options: RequestInit = {}) {
   return data;
 }
 
+export type TokenConfig = {
+  symbol: string;
+  network: string;
+  chain_id: number;
+  contract_address: string;
+  polygon_contract_address: string;
+};
+
 export type MineState = {
   active: boolean;
   pending: number;
@@ -52,6 +60,7 @@ export type UserState = {
   assets: Record<string, number>;
   total_mined: number;
   mine: MineState;
+  token?: TokenConfig;
 };
 
 export type Asset = {
@@ -64,17 +73,36 @@ export type Asset = {
   color: string;
 };
 
+export type SwapQuote = {
+  from_zwap: number;
+  to_symbol: string;
+  network: string;
+  rate: string;
+  gross_usd: number;
+  fee_usd: number;
+  fee_pct: number;
+  dest_amount: number;
+  expires_in: number;
+};
+
+export type WithdrawResult = {
+  delivered: number;
+  fee: number;
+  network: string;
+  user: UserState;
+};
+
 export const api = {
   me: (): Promise<UserState> => request("/me"),
   mineStart: () => request("/mine/start", { method: "POST" }),
   mineClaim: (): Promise<UserState> => request("/mine/claim", { method: "POST" }),
-  swapAssets: (): Promise<{ zwap_usd: number; fee_pct: number; assets: Asset[] }> =>
+  swapAssets: (): Promise<{ zwap_usd: number; fee_pct: number; token: TokenConfig; assets: Asset[] }> =>
     request("/swap/assets"),
-  swapQuote: (zwap_amount: number, to_symbol: string) =>
+  swapQuote: (zwap_amount: number, to_symbol: string): Promise<SwapQuote> =>
     request("/swap/quote", { method: "POST", body: JSON.stringify({ zwap_amount, to_symbol }) }),
   swapExecute: (zwap_amount: number, to_symbol: string): Promise<UserState> =>
     request("/swap/execute", { method: "POST", body: JSON.stringify({ zwap_amount, to_symbol }) }),
-  withdraw: (symbol: string, amount: number, address: string) =>
+  withdraw: (symbol: string, amount: number, address: string): Promise<WithdrawResult> =>
     request("/withdraw", { method: "POST", body: JSON.stringify({ symbol, amount, address }) }),
   activity: (): Promise<any[]> => request("/activity"),
 };
