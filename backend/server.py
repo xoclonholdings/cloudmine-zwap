@@ -21,21 +21,31 @@ app = FastAPI(title="ZWAP MineSwap API")
 api_router = APIRouter(prefix="/api")
 
 # ---------------------------------------------------------------------------
-# Economic constants — SIMULATED.
-# Everything the "real" system would compute server-side lives here so it is
-# trivial to swap the simulation for real mining/pricing/liquidity later.
+# MineSwap token identity.
+# Ethereum ZWAP is authoritative for MineSwap. The Polygon deployment is kept
+# as a separate reference and must never be merged into MineSwap balances.
 # ---------------------------------------------------------------------------
-ZWAP_USD = 0.05                 # notional ZWAP value in USD
-MINE_RATE_PER_HOUR = 120.0      # ZWAP accrued per hour while a session is active
-SESSION_HOURS = 6               # a mine session runs for 6h, then must restart
-SWAP_FEE_PCT = 0.01             # 1% swap fee
-WITHDRAW_FEE_PCT = 0.005        # 0.5% network/withdraw fee
+ZWAP_TOKEN = {
+    "symbol": "ZWAP",
+    "network": "Ethereum",
+    "chain_id": 1,
+    "contract_address": "0x567ce1882b2b1b16fcf54f2f1ae9a843069955f0",
+    "polygon_contract_address": "0xe8898453af13b9496a6e8ada92c6efdaf4967a81",
+}
 
-# Dynamic asset registry (spec: Swap Layer — supported assets & networks)
+# Development economic constants. These keep the scaffold operational while
+# wallet signing, live pricing and production settlement are integrated.
+ZWAP_USD = 0.05
+MINE_RATE_PER_HOUR = 120.0
+SESSION_HOURS = 6
+SWAP_FEE_PCT = 0.01
+WITHDRAW_FEE_PCT = 0.005
+
+# Destination registry. ZWAP itself always originates on Ethereum in MineSwap.
 ASSET_REGISTRY = [
     {"symbol": "BTC", "name": "Bitcoin", "network": "Bitcoin", "price_usd": 64000.0, "min_withdraw": 0.0002, "decimals": 8, "color": "#f7931a"},
     {"symbol": "ETH", "name": "Ethereum", "network": "Ethereum", "price_usd": 3100.0, "min_withdraw": 0.01, "decimals": 6, "color": "#627eea"},
-    {"symbol": "USDC", "name": "USD Coin", "network": "Polygon", "price_usd": 1.0, "min_withdraw": 5.0, "decimals": 2, "color": "#2775ca"},
+    {"symbol": "USDC", "name": "USD Coin", "network": "Ethereum", "price_usd": 1.0, "min_withdraw": 5.0, "decimals": 2, "color": "#2775ca"},
     {"symbol": "POL", "name": "Polygon", "network": "Polygon", "price_usd": 0.55, "min_withdraw": 5.0, "decimals": 4, "color": "#8247e5"},
 ]
 ASSET_MAP = {a["symbol"]: a for a in ASSET_REGISTRY}
@@ -49,9 +59,6 @@ def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-# ---------------------------------------------------------------------------
-# Request models
-# ---------------------------------------------------------------------------
 class MineStartResp(BaseModel):
     ok: bool
 
@@ -72,9 +79,6 @@ class WithdrawReq(BaseModel):
     address: str
 
 
-# ---------------------------------------------------------------------------
-# User / ledger helpers
-# ---------------------------------------------------------------------------
 async def get_or_create_user(uid: str) -> dict:
     if not uid:
         raise HTTPException(status_code=400, detail="Missing X-User-Id header")
@@ -87,7 +91,7 @@ async def get_or_create_user(uid: str) -> dict:
         "zwap_balance": 0.0,
         "assets": {a["symbol"]: 0.0 for a in ASSET_REGISTRY},
         "total_mined": 0.0,
-        "session": None,  # {id, started_at, expires_at, rate, last_accrued_at}
+        "session": None,
     }
     await db.users.insert_one(doc)
     return doc
@@ -115,11 +119,11 @@ async def record_activity(uid: str, kind: str, title: str, detail: str, amount: 
     await db.activities.insert_one({
         "id": str(uuid.uuid4()),
         "user_id": uid,
-        "kind": kind,          # mine | swap | withdraw
+        "kind": kind,
         "title": title,
         "detail": detail,
         "amount": amount,
-        "status": status,      # confirmed | submitted | claimed
+        "status": status,
         "created_at": iso(now()),
     })
 
@@ -132,6 +136,7 @@ def public_user(user: dict) -> dict:
         "zwap_usd": round(user["zwap_balance"] * ZWAP_USD, 2),
         "assets": user["assets"],
         "total_mined": round(user.get("total_mined", 0.0), 4),
+        "token": ZWAP_TOKEN,
         "mine": {
             "active": active,
             "pending": pending,
@@ -142,12 +147,9 @@ def public_user(user: dict) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 @api_router.get("/")
 async def root():
-    return {"message": "ZWAP MineSwap API", "zwap_usd": ZWAP_USD}
+    return {"message": "ZWAP MineSwap API", "zwap_usd": ZWAP_USD, "token": ZWAP_TOKEN}
 
 
 @api_router.get("/me")
@@ -185,24 +187,36 @@ async def mine_claim(x_user_id: str = Header(None)):
     total_mined = round(user.get("total_mined", 0.0) + pending, 4)
     session["last_accrued_at"] = iso(now())
     if not active:
-        session = None  # session finished — cleared after final claim
+        session = None
     await db.users.update_one(
         {"id": user["id"]},
         {"$set": {"zwap_balance": new_balance, "total_mined": total_mined, "session": session}},
     )
-    await record_activity(user["id"], "mine", "Mining reward claimed",
-                          "Server-validated session reward", f"+{pending} ZWAP", "claimed")
+    await record_activity(
+        user["id"],
+        "mine",
+        "Mining reward claimed",
+        "Server-validated MineSwap reward · Ethereum ZWAP",
+        f"+{pending} ZWAP",
+        "claimed",
+    )
     updated = await db.users.find_one({"id": user["id"]})
     return public_user(updated)
 
 
 @api_router.get("/swap/assets")
 async def swap_assets():
-    return {"zwap_usd": ZWAP_USD, "fee_pct": SWAP_FEE_PCT, "assets": ASSET_REGISTRY}
+    return {
+        "zwap_usd": ZWAP_USD,
+        "fee_pct": SWAP_FEE_PCT,
+        "token": ZWAP_TOKEN,
+        "assets": ASSET_REGISTRY,
+    }
 
 
 @api_router.post("/swap/quote")
 async def swap_quote(req: SwapQuoteReq, x_user_id: str = Header(None)):
+    await get_or_create_user(x_user_id)
     asset = ASSET_MAP.get(req.to_symbol)
     if not asset:
         raise HTTPException(status_code=400, detail="Unsupported asset")
@@ -240,10 +254,18 @@ async def swap_execute(req: SwapExecuteReq, x_user_id: str = Header(None)):
     new_zwap = round(user["zwap_balance"] - req.zwap_amount, 4)
     assets = user["assets"]
     assets[req.to_symbol] = round(assets.get(req.to_symbol, 0.0) + dest, asset["decimals"])
-    await db.users.update_one({"id": user["id"]}, {"$set": {"zwap_balance": new_zwap, "assets": assets}})
-    await record_activity(user["id"], "swap", f"Swapped to {req.to_symbol}",
-                          f"{round(req.zwap_amount,4)} ZWAP -> {dest} {req.to_symbol}",
-                          f"+{dest} {req.to_symbol}", "confirmed")
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"zwap_balance": new_zwap, "assets": assets}},
+    )
+    await record_activity(
+        user["id"],
+        "swap",
+        f"Swapped to {req.to_symbol}",
+        f"{round(req.zwap_amount, 4)} Ethereum ZWAP -> {dest} {req.to_symbol}",
+        f"+{dest} {req.to_symbol}",
+        "confirmed",
+    )
     updated = await db.users.find_one({"id": user["id"]})
     return public_user(updated)
 
@@ -257,7 +279,10 @@ async def withdraw(req: WithdrawReq, x_user_id: str = Header(None)):
     if not req.address or len(req.address.strip()) < 8:
         raise HTTPException(status_code=400, detail="Enter a valid destination address")
     if req.amount < asset["min_withdraw"]:
-        raise HTTPException(status_code=400, detail=f"Minimum withdrawal is {asset['min_withdraw']} {req.symbol}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Minimum withdrawal is {asset['min_withdraw']} {req.symbol}",
+        )
     if req.amount > user["assets"].get(req.symbol, 0.0) + 1e-9:
         raise HTTPException(status_code=400, detail="Insufficient balance")
     fee = round(req.amount * WITHDRAW_FEE_PCT, asset["decimals"])
@@ -265,11 +290,21 @@ async def withdraw(req: WithdrawReq, x_user_id: str = Header(None)):
     assets = user["assets"]
     assets[req.symbol] = round(assets[req.symbol] - req.amount, asset["decimals"])
     await db.users.update_one({"id": user["id"]}, {"$set": {"assets": assets}})
-    await record_activity(user["id"], "withdraw", f"Withdraw {req.symbol}",
-                          f"To {req.address[:6]}...{req.address[-4:]} - {asset['network']}",
-                          f"-{req.amount} {req.symbol}", "submitted")
+    await record_activity(
+        user["id"],
+        "withdraw",
+        f"Withdraw {req.symbol}",
+        f"To {req.address[:6]}...{req.address[-4:]} · {asset['network']}",
+        f"-{req.amount} {req.symbol}",
+        "submitted",
+    )
     updated = await db.users.find_one({"id": user["id"]})
-    return {"delivered": delivered, "fee": fee, "network": asset["network"], "user": public_user(updated)}
+    return {
+        "delivered": delivered,
+        "fee": fee,
+        "network": asset["network"],
+        "user": public_user(updated),
+    }
 
 
 @api_router.get("/activity")
@@ -289,8 +324,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+)
 logger = logging.getLogger(__name__)
 
 
